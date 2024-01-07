@@ -1,18 +1,16 @@
 package main
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"time"
 
+	"github.com/dghubble/gologin/v2"
+	"github.com/dghubble/gologin/v2/github"
 	"golang.org/x/oauth2"
-	"golang.org/x/oauth2/github"
+	oauth2github "golang.org/x/oauth2/github"
 )
 
 const addr = "localhost:8080"
@@ -29,14 +27,16 @@ func main() {
 	conf := oauth2.Config{
 		ClientID:     githubClientID,
 		ClientSecret: githubClientSecret,
-		Endpoint:     github.Endpoint,
+		Endpoint:     oauth2github.Endpoint,
 	}
 
-	lf := &ghLoginFlow{conf: &conf}
+	cookieConf := gologin.DebugOnlyCookieConfig
+	loginHandler := github.LoginHandler(&conf, nil)
+	callbackHandler := github.CallbackHandler(&conf, http.HandlerFunc(githubCallbackHandler), nil)
 
-	http.HandleFunc("/", lf.rootHandler)
-	http.HandleFunc("/login", lf.githubLoginHandler)
-	http.HandleFunc("/github/callback", lf.githubCallbackHandler)
+	http.HandleFunc("/", rootHandler)
+	http.Handle("/login", github.StateHandler(cookieConf, loginHandler))
+	http.Handle("/github/callback", github.StateHandler(cookieConf, callbackHandler))
 
 	slog.Info("Listening on...", slog.String("addr", addr))
 	panic(http.ListenAndServe(addr, nil))
@@ -56,118 +56,24 @@ const rootHTML = `
 </html>
 `
 
-type ghLoginFlow struct {
-	conf *oauth2.Config
-}
-
-func (lf *ghLoginFlow) rootHandler(w http.ResponseWriter, r *http.Request) {
+func rootHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, rootHTML)
 }
 
-func (lf *ghLoginFlow) githubLoginHandler(w http.ResponseWriter, r *http.Request) {
-	// Step 1: Request a user's GitHub identity
-	//
-	// ... by redirecting the user's browser to a GitHub login endpoint. We're not
-	// setting redirect_uri, leaving it to GitHub to use the default we set for
-	// this application: /github/callback
-	// We're also not asking for any specific scope, because we only need access
-	// to the user's public information to know that the user is really logged in.
-	//
-	// We're setting a random state cookie for the client to return
-	// to us when the call comes back, to prevent CSRF per
-	// section 10.12 of https://www.rfc-editor.org/rfc/rfc6749.html
-
-	state, err := randString(16)
+func githubCallbackHandler(w http.ResponseWriter, r *http.Request) {
+	githubUser, err := github.UserFromContext(r.Context())
 	if err != nil {
-		slog.Error("Failed to generate state", slog.String("err", err.Error()))
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
-	http.SetCookie(w, &http.Cookie{
-		Name:     "state",
-		Value:    state,
-		Path:     "/",
-		MaxAge:   int(time.Hour.Seconds()),
-		Secure:   r.TLS != nil,
-		HttpOnly: true,
-	})
-
-	redirectURL := lf.conf.AuthCodeURL(state)
-
-	http.Redirect(w, r, redirectURL, http.StatusMovedPermanently)
-}
-
-func (lf *ghLoginFlow) githubCallbackHandler(w http.ResponseWriter, r *http.Request) {
-	// Step 2: Users are redirected back to your site by GitHub
-	//
-	// The user is authenticated w/ GitHub by this point, and GH provides us
-	// a temporary code we can exchange for an access token using the app's
-	// full credentials.
-	//
-	// Start by checking the state returned by GitHub matches what
-	// we've stored in the cookie.
-
-	stateCookie, err := r.Cookie("state")
-	if err != nil {
-		http.Error(w, "state cookie not found", http.StatusBadRequest)
-		return
-	}
-
-	if r.URL.Query().Get("state") != stateCookie.Value {
-		http.Error(w, "state mismatch", http.StatusBadRequest)
-		return
-	}
-
-	// exchange the authorization code for an access token
-	code := r.URL.Query().Get("code")
-	if code == "" {
-		http.Error(w, "code not found", http.StatusBadRequest)
-		return
-	}
-
-	tok, err := lf.conf.Exchange(r.Context(), code)
-	if err != nil {
-		http.Error(w, "unable to exchange code for access token", http.StatusInternalServerError)
-		return
-	}
-
-	// Step 3: Use the access token to access the API
-	//
-	// With the access token in hand, we can access the GitHub API on behalf
-	// of the user. Since we didn't provide a scope, we only get access to
-	// the user's public information.
-	userInfo, err := lf.getGitHubUserInfo(r.Context(), tok)
-	if err != nil {
-		http.Error(w, "unable to get user info", http.StatusInternalServerError)
+		slog.Error("unable to get GitHub user", slog.String("err", err.Error()))
+		http.Error(w, "unable to get GitHub user", http.StatusInternalServerError)
 		return
 	}
 
 	w.Header().Set("Content-type", "application/json")
-	fmt.Fprint(w, string(userInfo))
-}
-
-func (lf *ghLoginFlow) getGitHubUserInfo(ctx context.Context, tok *oauth2.Token) ([]byte, error) {
-	client := lf.conf.Client(ctx, tok)
-
-	resp, err := client.Get("https://api.github.com/user")
+	buf, err := json.Marshal(githubUser)
 	if err != nil {
-		return nil, fmt.Errorf("unable to connect to GitHub API: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		http.Error(w, "unable to marshal GitHub user", http.StatusInternalServerError)
+		return
 	}
 
-	return io.ReadAll(resp.Body)
-}
-
-func randString(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-
-	return base64.URLEncoding.EncodeToString(b), nil
+	fmt.Fprint(w, string(buf))
 }
